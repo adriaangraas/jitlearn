@@ -28,7 +28,7 @@ if __name__ == '__main__':
         (0., 0., 0.),
         (0., 0., 0.),
         time_per_proj=0.012 * 10,
-        start_time=time() + 10,
+        start_time=time() + 15,
         device_ids=[0],
         iso_voxel_size=0.25,
         preload=True)
@@ -36,7 +36,7 @@ if __name__ == '__main__':
 
     # note: for a realtime dataset, use our custom iterator to continuously
     # generate samples, and specify the size of the buffer
-    pairs = iter(BufferingMultiProcessingDataLoaderIter(dl, 10))
+    pairs = iter(BufferingMultiProcessingDataLoaderIter(dl, max_len=10))
 
 
     def next_item():
