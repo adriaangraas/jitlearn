@@ -1,1 +1,4 @@
-/.idea
+.idea
+/scripts/paper
+/scripts/paper/*
+__pycache__

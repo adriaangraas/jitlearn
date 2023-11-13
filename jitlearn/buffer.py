@@ -1,14 +1,20 @@
+import itertools
 import time
 from typing import Any, Callable, List, Sequence
 
 import cupy as cp
 import numpy as np
 import torch
-from astrapy import aspitched, copy_to_texture, process
-from astrapy.kernels import ConeBackprojection, GeometrySequence
+from astrapy import ConeBackprojector
+from astrapy.data import aspitched
+from astrapy.kernel import copy_to_texture
+from astrapy.kernels import ConeBackprojection
+import astrapy.processing as process
+from astrapy.geom import GeometrySequence, VolumeGeometry
 from torch.utils.data.dataloader import (_DatasetKind,
                                          _MultiProcessingDataLoaderIter)
 from torch.utils.data.dataloader import _utils
+from jitlearn.bpkern import RealtimeBackProjection
 
 
 class ProjectionBufferBp:
@@ -21,7 +27,7 @@ class ProjectionBufferBp:
         load_fn: Callable,
         filter: str = 'ramlak',
         preproc_fn: Callable = None,
-        texture_type: str = 'pitch2D',
+        texture_type: str = 'array2d',
         batch_load: int = 0,
         verbose: bool = False,
         kernel_voxels_z: int = 1):
@@ -42,6 +48,7 @@ class ProjectionBufferBp:
         """
         self.verbose = verbose
         self._texture_type = texture_type
+        assert texture_type in ['array2d', 'pitch2d']
         self._projection_ids = projection_ids
         self._geoms = geometries
         self._filter = filter
@@ -49,9 +56,11 @@ class ProjectionBufferBp:
         self._load_fn = load_fn
         self._textures = {}
         self._batch_load = batch_load
+        # self._kernel = RealtimeBackProjection(
+        #     voxels_per_block=(16, 32, kernel_voxels_z))
         self._kernel = ConeBackprojection(
             voxels_per_block=(16, 32, kernel_voxels_z),
-            min_limit_projs=75)
+            projs_per_block=150)
         sorted(geometries)
 
         # this is to support taking contiguous slices which increases memory usage
@@ -91,9 +100,10 @@ class ProjectionBufferBp:
             projections_cpu = self._load_fn(ids_to_load)
 
             # projs need to be independent 2D arrays in order to be pitched
-            projs_gpu = cp.asarray(projections_cpu, dtype=cp.float32)
+            projs_gpu = [cp.asarray(p, dtype=cp.float32) for p in
+                         projections_cpu]
             if self._preproc_fn is not None:
-                self._preproc_fn(projs_gpu)
+                [self._preproc_fn(p) for p in projs_gpu]
             # preweighting requires geometries to be given at __init__
             geoms = [self._geoms[id] for id in ids_to_load]
             process.preweight(projs_gpu, geoms)
@@ -101,10 +111,14 @@ class ProjectionBufferBp:
                 process.filter(projs_gpu, filter=self._filter,
                                verbose=self.verbose)
 
-            for i, p in zip(ids_to_load, projs_gpu):
+            for i, (id, p) in enumerate(zip(ids_to_load, projs_gpu)):
                 if self._texture_type.lower() == 'pitch2d':
-                    p = aspitched(cp.array(p, copy=False))
-                self._textures[i] = copy_to_texture(p, type=self._texture_type)
+                    p = aspitched(p, cp)
+                    # p = aspitched(cp.array(p, copy=False))
+                self._textures[id] = copy_to_texture(p,
+                                                     type=self._texture_type)
+                projs_gpu[i] = None  # clean up old GPU memory
+                cp.get_default_memory_pool().free_all_blocks()
 
         return [self._textures[i] for i in ids]
 
@@ -126,59 +140,101 @@ class ProjectionBufferBp:
 
     def __call__(self,
                  ids: range,
-                 volume_shape: Sequence,
-                 volume_extent_min: Sequence,
-                 volume_extent_max: Sequence,
-                 volume_rotation: Sequence,
-                 dtype=cp.float32
-                 ):
+                 vol_geom: VolumeGeometry,
+                 dtype=cp.float32):
         """Reconstruct a volume."""
+
+        if not hasattr(self, '_projector'):
+            self._projector = ConeBackprojector(kernel=self._kernel)
+
+        self._projector.volume = cp.zeros(vol_geom.shape, dtype=dtype)
+
+        # this could be different every call, but should not hamper performance
+        self._projector.volume_geometry = vol_geom
+
         assert ids.step in (1, 2)
         if not all(i in self._projection_ids for i in ids):
             raise ValueError(
                 f"`ids` have to be indices of the projections. Some of "
                 f" {ids} are not in {self._projection_ids}.")
 
-        textures = self._load_proj(ids)
-
-        if not hasattr(self, 'volume'):
-            self.volume = cp.zeros(tuple(volume_shape), dtype=dtype)
-        else:
-            self.volume.fill(0.)
+        # ConeBackprojector normally sets textures via projector setter
+        textures = cp.asarray([tex.ptr for tex in self._load_proj(ids)])
+        self._projector._textures = textures
+        self._projector._texture_cuda_array_valid = True
 
         if ids.step == 1:
             idx1 = self._geomseq_id[ids.start]
             idx2 = self._geomseq_id[ids.stop]
             sl = slice(idx1, idx2)
-            subgeomseq = self._geomseq.take(sl)
+            geomseq = self._geomseq.take(sl)
         elif ids.step == 2:
             idx1 = self._geomseq_id_mixed[ids.start]
             idx2 = self._geomseq_id_mixed[ids.stop]
             if ids.start % 2 == 0:
-                subgeomseq = self._geomseq_even.take(slice(idx1, idx2))
+                geomseq = self._geomseq_even.take(slice(idx1, idx2))
             else:
-                subgeomseq = self._geomseq_odd.take(slice(idx1, idx2))
+                geomseq = self._geomseq_odd.take(slice(idx1, idx2))
 
+        self._projector.projection_geometry = geomseq
+        self._projector()
+        return self._projector.volume
 
-        params = self._kernel.geoms2params(
-            subgeomseq,
-            self.volume.shape,
-            volume_extent_min,
-            volume_extent_max,
-            volume_rotation,
-            fdk_weighting=False)
-
-        self._kernel(
-            textures,
-            params,
-            self.volume,
-            tuple(volume_extent_min),
-            tuple(volume_extent_max),
-            tuple(volume_rotation))
-
-        self.volume[...] = cp.reshape(self.volume,
-                                      tuple(reversed(self.volume.shape))).T
-        return cp.copy(self.volume)
+    # def __call__(self,
+    #              idss: List[range],
+    #              vol_geom: VolumeGeometry,
+    #              dtype=cp.float32
+    #              ):
+    #     """Reconstruct a volume."""
+    #     volume = cp.zeros((len(idss), *(vol_geom.shape)), dtype=dtype)
+    #
+    #     subgeomseqs = []
+    #     textures = []
+    #     for ids in idss:
+    #         assert ids.step in (1, 2)
+    #         if not all(i in self._projection_ids for i in ids):
+    #             raise ValueError(
+    #                 f"`ids` have to be indices of the projections. Some of "
+    #                 f" {ids} are not in {self._projection_ids}.")
+    #
+    #         [textures.append(tex.ptr) for tex in self._load_proj(ids)]
+    #
+    #         if ids.step == 1:
+    #             idx1 = self._geomseq_id[ids.start]
+    #             idx2 = self._geomseq_id[ids.stop]
+    #             sl = slice(idx1, idx2)
+    #             subgeomseqs.append(self._geomseq.take(sl))
+    #         elif ids.step == 2:
+    #             idx1 = self._geomseq_id_mixed[ids.start]
+    #             idx2 = self._geomseq_id_mixed[ids.stop]
+    #             if ids.start % 2 == 0:
+    #                 subgeomseqs.append(
+    #                     self._geomseq_even.take(slice(idx1, idx2)))
+    #             else:
+    #                 subgeomseqs.append(
+    #                     self._geomseq_odd.take(slice(idx1, idx2)))
+    #
+    #     obj = GeometrySequence(
+    #         source_position=np.vstack([s.source_position for s in subgeomseqs]),
+    #         detector_position=np.vstack(
+    #             [s.detector_position for s in subgeomseqs]),
+    #         u=np.vstack([s.u for s in subgeomseqs]),
+    #         v=np.vstack([s.v for s in subgeomseqs]),
+    #         detector=GeometrySequence.DetectorSequence(
+    #             rows=np.hstack([s.detector.rows for s in subgeomseqs]),
+    #             cols=np.hstack([s.detector.cols for s in subgeomseqs]),
+    #             pixel_width=np.hstack(
+    #                 [s.detector.pixel_width for s in subgeomseqs]),
+    #             pixel_height=np.hstack(
+    #                 [s.detector.pixel_height for s in subgeomseqs]),
+    #         )
+    #     )
+    #     self.params = self._kernel.geoms2params(obj, vol_geom)
+    #     self._kernel(cp.asarray(textures), self.params, volume, vol_geom)
+    #
+    #     for v in volume:
+    #         v[...] = cp.reshape(v, tuple(reversed(v.shape))).T
+    # return volume
 
 
 class BufferingMultiProcessingDataLoaderIter(_MultiProcessingDataLoaderIter):

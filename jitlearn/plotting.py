@@ -1,12 +1,12 @@
 import matplotlib
 import matplotlib.pyplot as plt
 
-CM = 1/2.54
-DPI = 500
-# DPI = 100
+CM = 1/2.54  # inch
+# DPI = 500
+DPI = 100
 FONT = 'Arial'
 FONT_SIZE = 7
-# TEXTWIDTH = 18.35  # elsevier 5p
+# TEXTWIDTH = 18.35
 # COLUMNWIDTH = 9.0
 
 font = {'family': FONT,

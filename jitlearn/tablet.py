@@ -1,6 +1,9 @@
+import itertools
 import random
+import threading
 import time
 import warnings
+from multiprocessing.pool import ThreadPool
 from typing import Any, Callable, Sequence
 
 import astrapy.kernels
@@ -9,7 +12,7 @@ import cupy.cuda
 import numpy as np
 import reflex
 import torch
-from astrapy import Detector, Geometry, suggest_volume_extent, voxel_size
+from astrapy import Detector, ProjectionGeometry, VolumeGeometry
 from reflex import centralize
 from torch.utils.data import IterableDataset
 
@@ -36,10 +39,10 @@ class TabletDataset(IterableDataset):
                  settings_path: str,
                  proj_ids: range,
                  voxels: Any,
-                 rand_pos_min: Sequence,
-                 rand_pos_max: Sequence,
-                 rand_rot_min: Sequence,
-                 rand_rot_max: Sequence,
+                 pos_min,
+                 pos_max,
+                 rot_min,
+                 rot_max,
                  darks_path: str = None,
                  flats_path: str = None,
                  iso_voxel_size: float = None,
@@ -54,7 +57,8 @@ class TabletDataset(IterableDataset):
                  squeeze: bool = False,
                  preload: bool = False,
                  start_time: float = None,
-                 n2i_mode: str = 'even_odd'):
+                 n2i_mode: str = 'even_odd',
+                 texture_type='array2d'):
         """
         Initialize the `TabletDataset`.
 
@@ -97,11 +101,11 @@ class TabletDataset(IterableDataset):
         self.squeeze = squeeze
         self.preload = preload
         self.n2i_mode = n2i_mode
-        self.rand_pos_min = rand_pos_min
-        self.rand_pos_max = rand_pos_max
-        self.rand_rot_min = rand_rot_min
-        self.rand_rot_max = rand_rot_max
-        self.start_time = None
+        self.pos_min = pos_min
+        self.pos_max = pos_max
+        self.rot_min = rot_min
+        self.rot_max = rot_max
+        self.texture_type = texture_type
 
         assert sequence_stride % 2 == 0, (
             "If stride is not even, information from even reconstructions "
@@ -117,10 +121,7 @@ class TabletDataset(IterableDataset):
                 projs_path, reflex.proj.PROJECTION_FILE_REGEX).keys()))
         self.proj_ids = proj_ids
 
-        if nr_angles_per_rot is None:
-            nr_angles_per_rot = len(self.proj_ids)
-
-        self.angles = (np.array(self.proj_ids)
+        angles = (np.array(self.proj_ids)
                        * reconstruction_rotation_intval / nr_angles_per_rot)
         if reco_interval is None:
             reco_interval = int(
@@ -128,7 +129,7 @@ class TabletDataset(IterableDataset):
                     2 * np.pi * nr_angles_per_rot / reconstruction_rotation_intval))
         self.reco_interval = reco_interval
 
-        geometry = self.reflex_geom(self.settings, self.angles,
+        geometry = self.reflex_geom(self.settings, angles,
                                     self.corrections)
         self.geometries = dict()
         for id, g in zip(self.proj_ids, geometry):
@@ -193,7 +194,12 @@ class TabletDataset(IterableDataset):
             preproc_fn=_preprocess_projs,
             batch_load=0,
             verbose=True,
-            kernel_voxels_z=min(self.voxels[-1], 6))
+            kernel_voxels_z=min(self.voxels[-1], 6),
+            texture_type=self.texture_type)
+
+        # preload also means prefilter
+        if self.preload:
+            self.bufferbp._load_proj(self.proj_ids)
 
         # start logging
         self._iteration = -1
@@ -204,15 +210,16 @@ class TabletDataset(IterableDataset):
             self.start_time = time.time()
         else:
             print(f"I will start at {self.start_time}, which is in "
-            f"{self.start_time - time.time()} seconds.")
+                  f"{self.start_time - time.time()} seconds.")
             if self.start_time < time.time():
                 warnings.warn("Start time is in the past. Provide a moment"
                               " in the future that allows sufficient time"
                               " for the dataset to load.")
             else:
                 from threading import current_thread
-                print(f"Experiment not started yet, sleeping {self.start_time - time.time()} seconds in"
-                      f" thread {current_thread()}.")
+                print(f"Experiment not started yet, sleeping "
+                      f"{self.start_time - time.time()} seconds in "
+                      f"thread {current_thread()}.")
                 time.sleep(self.start_time - time.time())
 
         return self
@@ -239,7 +246,7 @@ class TabletDataset(IterableDataset):
         #     time.sleep(-t)
 
         num = self.number(self.iteration, t)
-        pos, rot = self.space(self.iteration, t)
+        pos, rot = self.space(self.iteration, num, t)
         return self.reconstruct(
             self.bufferbp,
             num,
@@ -258,6 +265,9 @@ class TabletDataset(IterableDataset):
         # shift volume extent to position
         vol_extent_min = np.array(self.vol_ext_min) - vol_position
         vol_extent_max = np.array(self.vol_ext_max) - vol_position
+        vol_geom = VolumeGeometry(self.voxels, [self.voxel_size] * 3,
+                                  vol_extent_min, vol_extent_max,
+                                  vol_rotation)
 
         if self.n2i_mode == 'even_odd' or self.n2i_mode == 'even_odd_mixed':
             # the following split of loops is necessary to facilitate a check
@@ -292,43 +302,41 @@ class TabletDataset(IterableDataset):
                                             "over in odd reconstructions.")
             inputs = []
             targets = []
-            for e, o in zip(in_ranges, out_ranges):
-                inputs.append(
-                    bufferbp(
-                        e,
-                        self.voxels,
-                        vol_extent_min,
-                        vol_extent_max,
-                        volume_rotation=vol_rotation))
-                targets.append(
-                    bufferbp(
-                        o,
-                        self.voxels,
-                        vol_extent_min,
-                        vol_extent_max,
-                        volume_rotation=vol_rotation))
+            with cp.cuda.Stream():
+                for e, o in zip(in_ranges, out_ranges):
+                    inputs.append(bufferbp(e, vol_geom))
+                    targets.append(bufferbp(o, vol_geom))
+            # ids = []
+            # for e, o in zip(in_ranges, out_ranges):
+            #     ids.append(e)
+            #     ids.append(o)
+            # out = bufferbp(ids, vol_geom)
+            # inputs, targets = [], []
+            # for i, rec in enumerate(out):
+            #     if i % 2 == 0:
+            #         inputs.append(rec)
+            #     else:
+            #         targets.append(rec)
         elif self.n2i_mode == 'full':
-            in_ranges = []
-            for t in range(self.seq_len):
-                t_start = num_start + t * self.seq_stride
-                t_stop = t_start + numbers_sample_size
-                in_range = range(t_start, t_stop)
-                in_ranges.append(in_range)
+            with cp.cuda.Stream():
+                in_ranges = []
+                for t in range(self.seq_len):
+                    t_start = num_start + t * self.seq_stride
+                    t_stop = t_start + numbers_sample_size
+                    in_range = range(t_start, t_stop)
+                    in_ranges.append(in_range)
 
-            inputs = []
-            targets = []
-            for e in in_ranges:
-                rec = bufferbp(
-                    e,
-                    self.voxels,
-                    vol_extent_min,
-                    vol_extent_max,
-                    volume_rotation=vol_rotation)
-                inputs.append(rec)
-                targets.append(rec)
+                inputs = []
+                targets = []
+                out = bufferbp(in_ranges, vol_geom)
+                for rec in out:
+                    inputs.append(rec)
+                    targets.append(rec)
+
         else:
-            raise ValueError("Mode `self.n2i_mode` unknown. Choose `even_odd` or "
-                             "`even_odd_mixed`.")
+            raise ValueError(
+                "Mode `self.n2i_mode` unknown. Choose 'even_odd', "
+                "'even_odd_mixed', or 'full'.")
 
         info = {
             'vol_rotation': np.array(vol_rotation, dtype=np.float32),
@@ -336,6 +344,14 @@ class TabletDataset(IterableDataset):
                             - np.array(vol_extent_min, dtype=np.float32),
             'voxel_size': np.array(self.voxel_size, dtype=np.float32),
             'num_start': np.array(num_start, dtype=np.int32)}
+        # if self.device_ids is None or len(self.device_ids) == 0:
+        #     out = ([torch.as_tensor(i, device='cuda') for i in inputs],
+        #            [torch.as_tensor(t, device='cuda') for t in targets],
+        #            info)
+        # else:
+        #     out = ([torch.asarray(i) for i in inputs],
+        #            [torch.asarray(t) for t in targets],
+        #            info)
         out = (
             torch.asarray(cp.asarray(inputs)),
             torch.asarray(cp.asarray(targets)),
@@ -365,8 +381,8 @@ class TabletDataset(IterableDataset):
                 cols=g.detector.cols,
                 pixel_width=g.detector.pixel_width,
                 pixel_height=g.detector.pixel_height)
-            geom = Geometry(
-                tube_pos=g.tube_position,
+            geom = ProjectionGeometry(
+                source_pos=g.tube_position,
                 det_pos=g.detector_position,
                 u_unit=hv,
                 v_unit=vv,
@@ -375,12 +391,32 @@ class TabletDataset(IterableDataset):
 
         return geoms
 
-    def space(self, iteration, t):
+    def space(self, iteration, num, t):
+        if isinstance(self.pos_min, Callable):
+            pos_min = self.pos_min(iteration, num, t)
+        else:
+            pos_min = self.pos_min
+
+        if isinstance(self.pos_max, Callable):
+            pos_max = self.pos_max(iteration, num, t)
+        else:
+            pos_max = self.pos_max
+
+        if isinstance(self.rot_min, Callable):
+            rot_min = self.rot_min(iteration, num, t)
+        else:
+            rot_min = self.rot_min
+
+        if isinstance(self.rot_max, Callable):
+            rot_max = self.rot_max(iteration, num, t)
+        else:
+            rot_max = self.rot_max
+
         return self.space_sampler(
-            vol_position_min=self.rand_pos_min,
-            vol_position_max=self.rand_pos_max,
-            vol_rotation_min=self.rand_rot_min,
-            vol_rotation_max=self.rand_rot_max)
+            vol_position_min=pos_min,
+            vol_position_max=pos_max,
+            vol_rotation_min=rot_min,
+            vol_rotation_max=rot_max)
 
     @staticmethod
     def space_sampler(vol_rotation_min: Sequence, vol_rotation_max: Sequence,
@@ -487,14 +523,14 @@ class RealtimeTabletDataset(TabletDataset):
         #         f"We could start giving out late data, but won't do it "
         #         f"unless you indicate this with `ignore_late`.")
 
-        print(f"Current time: {t}")
         curr_num = self.proj_ids.start + int(t // self.time_per_proj)
+        print(f"Current time: {t}. Current num: {curr_num}.")
 
         # remove unnecessary projections from the buffer
-        self.bufferbp.update_buffer = range(  # for memory management
-            max(curr_num, self.proj_ids.start),
-            curr_num + self.reco_size)
-
+        # self.bufferbp.update_buffer = range(  # for memory management
+        #     max(curr_num, self.proj_ids.start),
+        #     curr_num + self.reco_size)
+        #
         if curr_num >= self.proj_ids.stop:
             raise StopIteration
 
@@ -567,11 +603,11 @@ def dataloader_from_dataset(ds, batch_size, generator_seed=0):
         " property `device_ids`."
     g = torch.Generator()
     g.manual_seed(generator_seed)
-    assert len(ds.device_ids) > 0
+    # assert len(ds.device_ids) > 0
     dl = torch.utils.data.DataLoader(
         ds,
         batch_size=batch_size,
-        num_workers=len(ds.device_ids),
+        num_workers=0 if ds.device_ids is None else len(ds.device_ids),
         worker_init_fn=_worker_init_fn,
         pin_memory=True,
         generator=g)
